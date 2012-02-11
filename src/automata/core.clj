@@ -1,22 +1,39 @@
 (ns automata.core
   (:refer-clojure :exclude [concat])
   (:use
-   clojure.set
-   clojure.test))
+   clojure.test)
+  (:require
+   [clojure.set :as set]))
 
 (declare
+ find-transition
  ^:dynamic state-counter)
 
 (def epsilon ::epsilon)
 
 (defn- genstate [] (swap! state-counter inc))
 
+(defrecord StateManager
+    [automaton
+     current-state]
+  clojure.lang.IFn
+  (invoke [this input]
+    (let [state @(.current-state this)]
+      (if-let [transition (find-transition (.automaton this) state input)]
+        (reset! (.current-state this) (transition :to))
+        (throw (Exception. (str "No transition from current state with input: " input))))
+      this)))
+
 (defrecord Automaton
     [states      ;; Set of states
      alphabet    ;; The automaton's alphabet
      transitions ;; A set of transitions
      start       ;; The star states
-     final])     ;; A set of final states
+     final]      ;; A set of final states
+
+  clojure.lang.IFn
+  (invoke [this]
+    (StateManager. this (atom (.start this)))))
 
 (defn- mk-transition
   [from to input]
@@ -41,6 +58,10 @@
        (if kvs
          (recur ret (first kvs) (second kvs) (nnext kvs))
          ret))))
+
+;;
+;; ==== NFA to DFA conversions
+;;
 
 (defn- reachable
   "Returns the set of states that are reachable from the given states
@@ -71,14 +92,15 @@
        ;; already been traversed to the result set as well as the list
        ;; of unhandled states and recur.
        (loop [states    states
-              dests     (reachable nfa #{(first remaining)} epsilon)
+              dests     (seq (reachable nfa #{(first remaining)} epsilon))
               remaining (next remaining)]
-         (if (or (nil? dests) (states (first dests)))
+         (if (nil? dests)
            [states remaining]
            (recur
             (conj states (first dests))
-            (conj remaining (first dests))
-            (next dests)))))
+            (next dests)
+            (if (contains? states (first dests))
+              remaining (conj remaining (first dests)))))))
       states)))
 
 (defn- conj-remaining-nfa-states
@@ -113,7 +135,7 @@
 (defn- set-final-states-from-nfa
   [dfa nfa]
   (let [states (filter
-                #(seq (intersection % (.final nfa)))
+                #(seq (set/intersection % (.final nfa)))
                 (.states dfa))]
     (assoc dfa :final (apply hash-set states))))
 
@@ -125,41 +147,125 @@
         (conj-remaining-nfa-states nfa)
         (set-final-states-from-nfa nfa))))
 
+;;
+;; ==== DFA minimization
+;;
+
+(defn- minimize
+  [dfa]
+  ;; Nothing yet
+  dfa)
+
+;;
+;; ==== Operations
+;;
+
 (defn- concat
   [a b]
   (let [epsilons (map #(mk-transition % (.start b) epsilon) (.final a))]
+    (minimize
+     (nfa-to-dfa
+      (Automaton.
+       (set/union (.states a) (.states b))
+       (set/union (.alphabet a) (.alphabet b))
+       (set/union (.transitions a) (.transitions b) epsilons)
+       (.start a)
+       (.final b))))))
+
+(defn- union
+  [a b]
+  (let [s (genstate)
+        t #{(mk-transition s (.start a) epsilon)
+            (mk-transition s (.start b) epsilon)}]
     (nfa-to-dfa
      (Automaton.
-      (union (.states a) (.states b))
-      (union (.alphabet a) (.alphabet b))
-      (union (.transitions a) (.transitions b) epsilons)
-      (.start a)
-      (.final b)))))
+      (set/union (.states a) (.states b) #{s})
+      (set/union (.alphabet a) (.alphabet b))
+      (set/union (.transitions a) (.transitions b) t)
+      s
+      (set/union (.final a) (.final b))))))
 
-(defn- build
+;;
+;; ==== Evaluating the automaton
+;;
+
+(defn- find-transition
+  [automaton from input]
+  (first
+   (filter
+    #(and (= from (% :from)) (= input (% :input)))
+    (.transitions automaton))))
+
+(defn final?
+  [state-manager]
+  (let [state @(.current-state state-manager)]
+    (contains?
+     (.. state-manager automaton final)
+     state)))
+
+;;
+;; ==== Defining the automaton
+;;
+
+(defn- parse-automaton
+  [automaton]
+  (if (list? automaton)
+    (let [[op & stmts] automaton]
+      (cond
+       (= 'union op)
+       (apply union (map parse-automaton stmts))
+
+       :else
+       (throw (Exception. (str "Unknown operator: " op)))))
+    (basic-automaton automaton)))
+
+(defn build
   [definitions]
   (binding [state-counter (atom 0)]
     (let [[name part & parts] (first definitions)]
-      (loop [res (basic-automaton part) parts parts]
+      (loop [res (parse-automaton part) parts parts]
         (if parts
-          (recur (concat res (basic-automaton (first parts))) (next parts))
+          (recur (concat res (parse-automaton (first parts))) (next parts))
           res)))))
 
 (defmacro defautomata
   [name & definition]
   `(def ~name (build '~definition)))
 
-(defn start
-  [automaton]
-  (.start automaton))
+(defautomata basic-concat (start :zomg :hi))
+(defautomata basic-union  (start :zomg (union :hi :2u)))
 
-(defn transition
-  [automaton from input]
-  ;; Stuff
-  )
+(deftest basic-concat-test
+  (let [state (basic-concat)]
+    (is (not (final? state)))
+    (is (state :zomg))
+    (is (not (final? state)))
+    (is (state :hi))
+    (is (final? state))
 
-(defautomata basic
-  (start :zomg :hi))
+    (is (thrown? Exception (state :zomg)))
+    (is (thrown? Exception (state :hi))))
 
-(deftest basic-automaton
-  (println "GOT: " basic))
+  ;; Handling errors
+  (let [state (basic-concat)]
+    (is (thrown? Exception (state :hi)))
+    (is (state :zomg))
+    (is (thrown? Exception (state :zomg)))))
+
+(deftest basic-union-test
+  (let [state (basic-union)]
+    (is (not (final? state)))
+    (is (state :zomg))
+    (is (not (final? state)))
+    (is (state :hi))
+    (is (final? state)))
+
+  (let [state (basic-union)]
+    (state :zomg)
+    (is (state :2u))
+    (is (final? state)))
+
+  ;; Handling errors
+  (let [state (basic-union)]
+    (state :zomg)
+    (is (thrown? Exception (state :zomg)))))

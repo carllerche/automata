@@ -3,7 +3,8 @@
   (:use
    clojure.test)
   (:require
-   [clojure.set :as set]))
+   [clojure.set     :as set]
+   [clojure.java.io :as io]))
 
 (declare
  find-transition
@@ -58,6 +59,33 @@
        (if kvs
          (recur ret (first kvs) (second kvs) (nnext kvs))
          ret))))
+
+;;
+;; ==== GraphViz file generation
+;;
+
+(defn- dot-edges
+  [automaton]
+  (map
+   (fn [{:keys [from to input]}]
+     (format "%s -> %s [ label = \"%s\" ];\n" from to input))
+   (.transitions automaton)))
+
+(defn- gendot
+  [automaton]
+  (str "digraph finite_state_machine {\n"
+       "rankdir=LR;"
+       "size=\"8,5\"\n"
+       "node [shape = doublecircle];\n"
+       (apply str (map #(str " " %) (.final automaton)))
+       ";\nnode [shape = circle];\n"
+       (apply str (dot-edges automaton))
+       "}\n"))
+
+(defn write-dot
+  [automaton dest]
+  (with-open [writer (io/writer dest)]
+    (.write writer (gendot automaton))))
 
 ;;
 ;; ==== NFA to DFA conversions
@@ -207,6 +235,25 @@
 ;; ==== Defining the automaton
 ;;
 
+(defn- mk-state-map
+  [states]
+  (into {} (map-indexed (fn [i state] [state i]) (seq states))))
+
+(defn- map-transition
+  [state-map {:keys [from to input]}]
+  {:from (state-map from) :to (state-map to) :input input})
+
+(defn- normalize
+  "Cleans up the naming of the states"
+  [automaton]
+  (let [state-map (mk-state-map (.states automaton))]
+    (Automaton.
+     (into #{} (vals state-map))
+     (.alphabet automaton)
+     (into #{} (map (partial map-transition state-map) (.transitions automaton)))
+     (state-map (.start automaton))
+     (into #{} (map state-map (seq (.final automaton)))))))
+
 (defn- parse-automaton
   [automaton]
   (if (list? automaton)
@@ -226,7 +273,9 @@
       (loop [res (parse-automaton part) parts parts]
         (if parts
           (recur (concat res (parse-automaton (first parts))) (next parts))
-          res)))))
+          (let [ret (normalize res)]
+            (println ret)
+            ret))))))
 
 (defmacro defautomata
   [name & definition]
@@ -234,6 +283,8 @@
 
 (defautomata basic-concat (start :zomg :hi))
 (defautomata basic-union  (start :zomg (union :hi :2u)))
+
+(write-dot basic-union "zomg.dot")
 
 (deftest basic-concat-test
   (let [state (basic-concat)]

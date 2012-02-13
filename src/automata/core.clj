@@ -36,9 +36,31 @@
   (invoke [this]
     (StateManager. this (atom (.start this)))))
 
+(defn- final-states
+  [automaton]
+  (.final automaton))
+
+(defn- nonfinal-states
+  [automaton]
+  (set/difference (.states automaton) (.final automaton)))
+
+(defn- transitions-from
+  [automaton state input]
+  (filter
+   #(and (= state (% :from)) (= input (% :input)))
+   (.transitions automaton)))
+
+(defn- intersects?
+  [a b]
+  (seq (set/intersection a b)))
+
 (defn- mk-transition
   [from to input]
   {:from from :to to :input input})
+
+(defn- mk-e-transition
+  [from to]
+  {:from from :to to :input epsilon})
 
 (defn- basic-automaton
   [input]
@@ -176,42 +198,169 @@
         (set-final-states-from-nfa nfa))))
 
 ;;
+;; ==== Normalizing automata
+;;
+
+(defn- mk-state-map
+  [states]
+  ;; (into {} (map-indexed (fn [i state] [state i]) (seq states)))
+  (into {} (map (fn [state] [state (genstate)]) (seq states))))
+
+(defn- map-transition
+  [state-map {:keys [from to input]}]
+  {:from (state-map from) :to (state-map to) :input input})
+
+(defn- normalize
+  "Cleans up the naming of the states"
+  [automaton]
+  (let [state-map (mk-state-map (.states automaton))]
+    (Automaton.
+     (into #{} (vals state-map))
+     (.alphabet automaton)
+     (into #{} (map (partial map-transition state-map) (.transitions automaton)))
+     (state-map (.start automaton))
+     (into #{} (map state-map (seq (.final automaton)))))))
+
+;;
 ;; ==== DFA minimization
 ;;
 
+(defn- smallest
+  [a b]
+  (if (< (count a) (count b))
+    a b))
+
+(defn- reaches
+  "Returns the set of states for which a transition on the given input
+  leads to a state in the given set of destinations."
+  [dfa dests input]
+  (set
+   (filter
+    (fn [state]
+      (some
+       #(contains? dests (% :to))
+       (transitions-from dfa state input)))
+    (.states dfa))))
+
+(defn- refine-partition
+  "Returns the dfa with partition y refined with x."
+  [{:keys [remaining partitions] :as dfa} x y]
+  (let [a (set/intersection x y)
+        b (set/difference y x)]
+    (assoc dfa
+      :partitions (conj (disj partitions y) a b)
+      :remaining
+      (if (contains? remaining y)
+        (conj (disj remaining y) a b)
+        (conj remaining (smallest a b))))))
+
+(defn- refine-partitions
+  [{remaining :remaining :as dfa}]
+  (if (seq remaining)
+    (let [a (first remaining)]
+      (recur
+       (reduce
+        ;; Iterate over each input character and refine the partitions
+        (fn [dfa input]
+          (let [x (reaches dfa a input)
+                partitions (get dfa :partitions)]
+            (reduce
+             #(refine-partition %1 x %2)
+             dfa (filter #(and (not= x %) (intersects? x %)) partitions))))
+        (assoc dfa :remaining (disj remaining a))
+        (.alphabet dfa))))
+    dfa))
+
+(defn- minimized-dfa-from-partitions
+  [dfa]
+  (let [partitions (get dfa :partitions)
+        state-map  #(first (filter (fn [partition] (contains? partition %)) partitions))]
+    (Automaton.
+     partitions
+     (.alphabet dfa)
+     (map
+      (fn [{:keys [from to input]}]
+        {:from (state-map from) :to (state-map to) :input input})
+      (.transitions dfa))
+     (state-map (.start dfa))
+     (filter #(seq (set/intersection % (.final dfa))) partitions))))
+
 (defn- minimize
   [dfa]
-  ;; Nothing yet
-  dfa)
+  (let [final    (final-states dfa)
+        nonfinal (nonfinal-states dfa)]
+    (-> dfa
+        (assoc :remaining  #{final})
+        (assoc :partitions #{final nonfinal})
+        (refine-partitions)
+        (minimized-dfa-from-partitions)
+        (normalize))))
 
 ;;
 ;; ==== Operations
 ;;
 
 (defn- concat
-  [a b]
-  (let [epsilons (map #(mk-transition % (.start b) epsilon) (.final a))]
+  ([a] a)
+  ([a b]
+     (let [epsilons (map #(mk-transition % (.start b) epsilon) (.final a))]
+       (minimize
+        (nfa-to-dfa
+         (Automaton.
+          (set/union (.states a) (.states b))
+          (set/union (.alphabet a) (.alphabet b))
+          (set/union (.transitions a) (.transitions b) epsilons)
+          (.start a)
+          (.final b))))))
+  ([a b & more] (reduce concat (conj more b a))))
+
+(defn- union*
+  ([a b]
+     (let [s (genstate)
+           t #{(mk-transition s (.start a) epsilon)
+               (mk-transition s (.start b) epsilon)}]
+       (Automaton.
+        (set/union (.states a) (.states b) #{s})
+        (set/union (.alphabet a) (.alphabet b))
+        (set/union (.transitions a) (.transitions b) t)
+        s
+        (set/union (.final a) (.final b))))))
+
+(defn- union
+  ([a] a)
+  ([a b] (minimize (nfa-to-dfa (union* a b))))
+  ([a b & more] (reduce union (conj more b a))))
+
+(defn- intersection
+  ([a] a)
+  ([a b]
+     (let [unioned (nfa-to-dfa (union* a b))]
+       (normalize
+        (assoc unioned
+          :final
+          (filter
+           (fn [state]
+             (and (seq (set/intersection state (.final a)))
+                  (seq (set/intersection state (.final b)))))
+           (.final unioned))))))
+  ([a b & more] (reduce intersection (conj more b a))))
+
+(defn- kleen
+  "Kleen star"
+  [a]
+  (let [start (genstate)
+        final (genstate)]
     (minimize
      (nfa-to-dfa
       (Automaton.
-       (set/union (.states a) (.states b))
-       (set/union (.alphabet a) (.alphabet b))
-       (set/union (.transitions a) (.transitions b) epsilons)
-       (.start a)
-       (.final b))))))
-
-(defn- union
-  [a b]
-  (let [s (genstate)
-        t #{(mk-transition s (.start a) epsilon)
-            (mk-transition s (.start b) epsilon)}]
-    (nfa-to-dfa
-     (Automaton.
-      (set/union (.states a) (.states b) #{s})
-      (set/union (.alphabet a) (.alphabet b))
-      (set/union (.transitions a) (.transitions b) t)
-      s
-      (set/union (.final a) (.final b))))))
+       (set/union (.states a) #{start final})
+       (.alphabet a)
+       (conj
+        (set/union (.transitions a) (map #(mk-e-transition % start) (.final a)))
+        (mk-e-transition start (.start a))
+        (mk-e-transition start final))
+       start
+       (set/union (.final a) #{final}))))))
 
 ;;
 ;; ==== Evaluating the automaton
@@ -235,32 +384,19 @@
 ;; ==== Defining the automaton
 ;;
 
-(defn- mk-state-map
-  [states]
-  (into {} (map-indexed (fn [i state] [state i]) (seq states))))
-
-(defn- map-transition
-  [state-map {:keys [from to input]}]
-  {:from (state-map from) :to (state-map to) :input input})
-
-(defn- normalize
-  "Cleans up the naming of the states"
-  [automaton]
-  (let [state-map (mk-state-map (.states automaton))]
-    (Automaton.
-     (into #{} (vals state-map))
-     (.alphabet automaton)
-     (into #{} (map (partial map-transition state-map) (.transitions automaton)))
-     (state-map (.start automaton))
-     (into #{} (map state-map (seq (.final automaton)))))))
-
 (defn- parse-automaton
   [automaton]
   (if (list? automaton)
     (let [[op & stmts] automaton]
       (cond
-       (= 'union op)
+       (or (= '| op) (= 'union op))
        (apply union (map parse-automaton stmts))
+
+       (or (= '* op) (= 'kleen op))
+       (kleen (apply concat (map parse-automaton stmts)))
+
+       (or (= '& op) (= 'intersection op))
+       (apply intersection (map parse-automaton stmts))
 
        :else
        (throw (Exception. (str "Unknown operator: " op)))))
@@ -273,18 +409,23 @@
       (loop [res (parse-automaton part) parts parts]
         (if parts
           (recur (concat res (parse-automaton (first parts))) (next parts))
-          (let [ret (normalize res)]
-            (println ret)
-            ret))))))
+          (normalize res))))))
 
 (defmacro defautomata
   [name & definition]
   `(def ~name (build '~definition)))
 
 (defautomata basic-concat (start :zomg :hi))
+(defautomata basic-kleen  (start (* :zomg) :hi2u))
 (defautomata basic-union  (start :zomg (union :hi :2u)))
 
-(write-dot basic-union "zomg.dot")
+(defautomata basic-intersection
+  (start
+   (intersection
+    (union :foo :bar)
+    (union :bar :baz))))
+
+(write-dot basic-intersection "zomg.dot")
 
 (deftest basic-concat-test
   (let [state (basic-concat)]
@@ -303,6 +444,16 @@
     (is (state :zomg))
     (is (thrown? Exception (state :zomg)))))
 
+(deftest basic-kleen-star-test
+  (let [state (basic-kleen)]
+    (is (not (final? state)))
+    (is (state :zomg))
+    (is (not (final? state)))
+    (is (state :zomg))
+    (is (not (final? state)))
+    (is (state :hi2u))
+    (is (final? state))))
+
 (deftest basic-union-test
   (let [state (basic-union)]
     (is (not (final? state)))
@@ -320,3 +471,4 @@
   (let [state (basic-union)]
     (state :zomg)
     (is (thrown? Exception (state :zomg)))))
+

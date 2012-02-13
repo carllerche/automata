@@ -73,6 +73,11 @@
      s1
      #{s2})))
 
+(defn- empty-automaton
+  []
+  (let [s (genstate)]
+    (Automaton. #{s} #{} #{} s #{s})))
+
 (defn- assoc-conj
   ([map key val]
      (assoc map key (conj (get map key) val)))
@@ -418,16 +423,28 @@
 (defn- parse-automaton
   [automaton]
   (if (list? automaton)
-    (let [[op & stmts] automaton]
+    (let [[op & stmts] automaton
+          concat-stmts #(apply concat (map parse-automaton stmts))]
       (cond
+       ;; Core operations
        (or (= '| op) (= 'union op))
        (apply union (map parse-automaton stmts))
 
        (or (= '* op) (= 'kleen op))
-       (kleen (apply concat (map parse-automaton stmts)))
+       (kleen (concat-stmts))
 
        (or (= '& op) (= 'intersection op))
        (apply intersection (map parse-automaton stmts))
+
+       ;; ==== Sugar operations
+
+       (= '+ op)
+       (let [expr (concat-stmts)]
+         (concat expr (kleen expr)))
+
+       (= '? op)
+       (let [expr (concat-stmts)]
+         (union expr (empty-automaton)))
 
        :else
        (throw (Exception. (str "Unknown operator: " op)))))
@@ -456,7 +473,11 @@
     (union :foo :bar)
     (union :bar :baz))))
 
-(write-dot basic-intersection "zomg.dot")
+(defautomata basic-lulz
+  (start
+   :zomg (? :one :two)))
+
+(write-dot basic-lulz "zomg.dot")
 
 (deftest basic-concat-test
   (let [state (basic-concat)]

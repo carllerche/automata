@@ -47,7 +47,7 @@
 (defn- transitions-from
   [automaton state input]
   (filter
-   #(and (= state (% :from)) (= input (% :input)))
+   #(and (= state (% :from)) (or (nil? input) (= input (% :input))))
    (.transitions automaton)))
 
 (defn- intersects?
@@ -222,6 +222,48 @@
      (into #{} (map state-map (seq (.final automaton)))))))
 
 ;;
+;; ==== DFA pruning
+;;
+
+(defn- reaches
+  "Returns the set of states for which a transition on the given input
+  leads to a state in the given set of destinations."
+  ([dfa dests] (reaches dfa dests nil))
+  ([dfa dests input]
+     (set
+      (filter
+       (fn [state]
+         (some
+          #(contains? dests (% :to))
+          (transitions-from dfa state input)))
+       (.states dfa)))))
+
+(defn- remove-deadend-states
+  ([dfa] (remove-deadend-states dfa (.final dfa) (.final dfa)))
+  ([dfa states remaining]
+     (if (seq remaining)
+       (let [new (reaches dfa remaining)]
+         (recur
+          dfa
+          (set/union states new)
+          (set/difference new states)))
+       states)))
+
+(defn- prune
+  "Returns a DFA that accepts the same language but with all dead end
+  states pruned."
+  [dfa]
+  (let [pruned (remove-deadend-states dfa)]
+    (Automaton.
+     pruned
+     (.alphabet dfa)
+     (filter
+      #(and (contains? pruned (% :from)) (contains? pruned (% :to)))
+      (.transitions dfa))
+     (.start dfa)
+     (.final dfa))))
+
+;;
 ;; ==== DFA minimization
 ;;
 
@@ -229,18 +271,6 @@
   [a b]
   (if (< (count a) (count b))
     a b))
-
-(defn- reaches
-  "Returns the set of states for which a transition on the given input
-  leads to a state in the given set of destinations."
-  [dfa dests input]
-  (set
-   (filter
-    (fn [state]
-      (some
-       #(contains? dests (% :to))
-       (transitions-from dfa state input)))
-    (.states dfa))))
 
 (defn- refine-partition
   "Returns the dfa with partition y refined with x."
@@ -335,14 +365,15 @@
   ([a] a)
   ([a b]
      (let [unioned (nfa-to-dfa (union* a b))]
-       (normalize
-        (assoc unioned
-          :final
-          (filter
-           (fn [state]
-             (and (seq (set/intersection state (.final a)))
-                  (seq (set/intersection state (.final b)))))
-           (.final unioned))))))
+       (prune
+        (normalize
+         (assoc unioned
+           :final
+           (filter
+            (fn [state]
+              (and (seq (set/intersection state (.final a)))
+                   (seq (set/intersection state (.final b)))))
+            (.final unioned)))))))
   ([a b & more] (reduce intersection (conj more b a))))
 
 (defn- kleen
